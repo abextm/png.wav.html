@@ -1,0 +1,408 @@
+<!--
+Copyright 2020 Abex
+This program is free software. It comes without any warranty, to
+the extent permitted by applicable law. You can redistribute it
+and/or modify it freely.
+-->
+<!DOCTYPE html><html>
+	<head>
+		<title>png.wav.html</title>
+		<style>
+.fileBox {
+	border: 1px solid #000;
+}
+.fileBox canvas {
+	height: 256px;
+}
+body>*{
+	margin: 4px;
+}
+html,body {
+	width: 100%;
+	height: 100%;
+	margin: 0;
+}
+body {
+	display:flex;
+	flex-wrap: wrap;
+	align-items:flex-start;
+}
+.fileBox:not(.loaded) a, .fileBox:not(.loaded) audio {
+	display: none;
+}
+.inputBox {
+	background: #cfcfcf;
+	padding: 4px;
+}
+.redo {
+	float:right;
+}
+		</style>
+	</head>
+	<body>
+		<div class="inputBox">
+			<label for="file">Add an image</label><br>
+			<input type="file" id="file" accept="image/*"/><br>
+			or just drop it anywhere idc<br>
+			<label for="pixelRate">Speed (pixels/second)</label>
+			<input type="number" id="pixelRate" value="32" min="1"/><br>
+			<label for="height">Vertical size (buckets)</label>
+			<input type="number" id="height" value="256" min="4"/><br>
+			<label for="minFreq">Minimum freqency</label>
+			<input type="number" id="minFreq" value="100" min="1"/><br>
+			<label for="maxFreq">Maximum frequency</label>
+			<input type="number" id="maxFreq" value="20000" min="100"/><br>
+		</div>
+		<template id="fileTemplate">
+			<div class="fileBox">
+				<span class="name"></span><br>
+				<canvas></canvas><br>
+				<audio controls></audio><br>
+				<a class="dl">Download</a>
+				<a class="redo" href="javascript:void 0;">Recompute</a>
+			</div>
+		</template>
+
+		<script type="text/javascript but don't run it" id="webworker">
+let chunks = new Map();
+let sin = Math.sin;
+const sampleChunk = async ({chunkID, data, offset, width, stride, height, periods, sampleRate, pixelRate}) => {
+	let samplesPerPx = ~~(sampleRate / pixelRate);
+	let pxPerSample = 1 / samplesPerPx;
+	let numSamples = samplesPerPx * width;
+	let floatData = new Float32Array(numSamples);
+	offset = ~~((offset/width) * numSamples)
+	for (let y = 0; y < height; y++) {
+		let pxOffset = stride * y;
+		let period = periods[y];
+		(_=>{ // this closure is to make the firefox jit optimize harder. This make it about 8x faster
+			for (let x = 0, o = 0; x< width; x++) {		
+				let pxIdx = (pxOffset + x) * 4;
+				let intensity0 = (data[pxIdx] + data[pxIdx+1] + data[pxIdx+2]) * data[pxIdx+3];
+				let intensity1 = (data[pxIdx+4] + data[pxIdx+5] + data[pxIdx+6]) * data[pxIdx+7]
+				let end = o + samplesPerPx;
+				let oStart = o;
+				let intensityDelta = intensity1 - intensity0;
+				let deltaPerSample = pxPerSample * intensityDelta;
+				for (;o < end; o++) {
+					let intensity = ((o-oStart) * deltaPerSample) + intensity0;
+					floatData[o] += sin((offset+o)*period) * Math.pow(intensity, 5);
+				}
+			}
+		})();
+	}
+	let max = 0;
+	for (let i=0; i<numSamples; i++) {
+		max = Math.max(max, Math.abs(floatData[i]));
+	}
+	chunks.set(chunkID, floatData);
+	return {max, numSamples, chunkID};
+};
+const convertChunk = async({chunkID, max, numChannels}) => {
+	let floatArray = chunks.get(chunkID)
+	chunks.delete(chunkID);
+
+	let numSamples = floatArray.length
+	let data = new Int16Array(numSamples * numChannels);
+	for (let i=0; i<numSamples; i++) {
+		data[i*numChannels] = ((floatArray[i]/max) * 0x3FFF);
+	}
+	if (numChannels > 1) {
+		for (let i = 0; i<(numSamples*numChannels); i+=numChannels) {
+			let v =  data[i];
+			for (let c=1; c<numChannels; c++) {
+				data[i+c] = v;
+			}
+		}
+	}
+	return data;
+};
+if (typeof window == "undefined") {
+	onmessage = async e => {
+		try {
+			let [fnName, opts] = e.data;
+			let {chunkID} = opts;
+			let ok = await {sampleChunk, convertChunk}[fnName](opts);
+			postMessage({chunkID, ok});
+		} catch (err) {
+			postMessage({chunkID, err});
+		}
+	};
+}
+		</script>
+		<script>
+let generatePCM;
+
+let lastID = 1;
+let makeID = () => lastID++;
+if (!window.Worker) {
+	{
+		let s = document.createElement("script");
+		s.innerHTML = document.getElementById("webworker").innerHTML;
+		document.body.appendChild(s);
+	}
+	generatePCM = async (canvas, options) => {
+		let {width, height} = canvas;
+		let ctx = canvas.getContext("2d");
+		let chunks = [];
+		let max = 0;
+		let numSamples = 0;
+		let chunkWidth = 8;
+		for (let i=0; i<width; i+=chunkWidth) {
+			let chunkID = makeID();
+			let imData = ctx.getImageData(i, 0, Math.min(i+chunkWidth+1, width)-i, height);
+			let chunkOpts = {
+				chunkID,
+				...options,
+				data: imData.data,
+				stride: imData.width,
+				width: imData.width - 1,
+				height: imData.height,
+				offset: i,
+			}
+			let chunkMeta = await sampleChunk(chunkOpts);
+			rangeMode(i, i+chunkWidth, 1);
+			numSamples += chunkMeta.numSamples;
+			max = Math.max(max, chunkMeta.max);
+			await new Promise(requestAnimationFrame);
+			chunks.push(chunkID);
+		}
+		for (let i=0; i<chunks.length; i++) {
+			chunks[i] = await convertChunk({
+				chunkID: chunks[i],
+				max,
+				...options
+			});
+			rangeMode(i*chunkWidth, (i*chunkWidth)+chunkWidth, 2);
+			await new Promise(requestAnimationFrame);
+		}
+		return chunks;
+	};
+} else {
+	let workerSrc =  document.getElementById("webworker").innerHTML;
+	let blob = new Blob([workerSrc], {type: "text/javascript"});
+	let url = URL.createObjectURL(blob);
+	let workers = [];
+	let requests = new Map();
+	for (let i=0; i<4; i++) {
+		w = new Worker(url);
+		w.onmessage = e => {
+			let {chunkID, ok, err} = e.data;
+			let [okF, errF] = requests.get(chunkID);
+			requests.delete(chunkID);
+			if (err) {
+				errF(err);
+			} else {
+				okF(ok);
+			}
+		};
+		workers.push(w);
+	}
+	let doWork = (fnName, opts) => {
+		let {chunkID} = opts;
+		if (!chunkID) throw "no chunkid";
+		let done = new Promise((ok, err) => requests.set(chunkID, [ok, err]));
+		workers[chunkID%workers.length].postMessage([fnName, opts]);
+		return done;
+	};
+
+	generatePCM = async (canvas, options, rangeMode) => {
+		let startTime = performance.now();
+		let {width, height} = canvas;
+		let ctx = canvas.getContext("2d");
+		let chunks = [];
+		let max = 0;
+		let numSamples = 0;
+		let chunkWidth = 8;
+		for (let i=0; i<width; i+=chunkWidth) {
+			let chunkID = makeID();
+			let imData = ctx.getImageData(i, 0, Math.min(i+chunkWidth+1, width)-i, height);
+			let chunkOpts = {
+				chunkID,
+				...options,
+				data: imData.data,
+				stride: imData.width,
+				width: imData.width - 1,
+				height: imData.height,
+				offset: i,
+			}
+			chunks.push(doWork("sampleChunk", chunkOpts).then(v => {
+				rangeMode(i, i+chunkWidth, 1);
+				return v;	
+			}));
+		}
+		for (let i=0; i<chunks.length; i++) {	
+			let chunkMeta = await chunks[i];
+			numSamples += chunkMeta.numSamples;
+			max = Math.max(max, chunkMeta.max);
+			chunks[i]=chunkMeta.chunkID;
+		}
+		for (let i=0; i<chunks.length; i++) {
+			chunks[i] = doWork("convertChunk", {
+				chunkID: chunks[i],
+				max,
+				...options
+			}).then(v => {
+				rangeMode(i*chunkWidth, (i*chunkWidth)+chunkWidth, 2);
+				return v;
+			});
+		}
+		let out = await Promise.all(chunks);
+		console.log((performance.now() - startTime)/width, "ms/px");
+		return out;
+	};
+}
+const canvasToWAV = async (canvas, rangeMode, {minFreq, maxFreq, pixelRate}) => {
+	let options = {
+		sampleRate: 48000,
+		numChannels: 1,
+		pixelRate,
+	};
+
+	let height = canvas.height;
+	let periods = options.periods = new Float32Array(height);
+	for (let y = 0; y < height; y++) {
+		let freq = (((height-y)/height) * (maxFreq - minFreq)) + minFreq;
+		let period = 1 /((options.sampleRate / freq) / (Math.PI * 2));
+		periods[y] = period;
+	}
+
+	let chunks = await generatePCM(canvas, options, rangeMode);
+	let numSamples = chunks.reduce((acc, v) => acc + v.length, 0);
+
+	let header = new ArrayBuffer(0x100);
+	{
+		let intSize = 2;
+		let h = new DataView(header);
+		let o = 0;
+		let str = str => [...str].forEach(v => h.setUint8(o++, v.charCodeAt(0)));
+		let u16 = () => {let u=o;o+=2; return v => h.setUint16(u, v, true);};
+		let u32 = () => {let u=o;o+=4; return v => h.setUint32(u, v, true);};
+		str("RIFF");
+		let totalSize = [u32`cksize`, o];
+		str("WAVE");
+		{
+			str("fmt ");
+			let fmtSize = [u32`cksize`, o];
+			u16`wFormatTag`(1); /* PCM */
+			u16`nChannels`(options.numChannels);
+			u32`nSamplesPerSec`(options.sampleRate);
+			u32`nAvgBytesPerSec`(options.sampleRate * options.numChannels * intSize);
+			u16`nBlockAlign`(options.numChannels * intSize);
+			u16`wBitsPerSample`(intSize * 8);
+			fmtSize[0](o - fmtSize[1]);
+		}
+		{
+			str("fact");
+			let factSize = [u32`cksize`, o];
+			u32`dwSampleLength`(options.numChannels * numSamples);
+			factSize[0](o - factSize[1]);
+		}
+		{
+			str("data")
+			u32`cksize`(options.numChannels * numSamples * intSize);
+			totalSize[0](o+(options.numChannels * numSamples * intSize) - totalSize[1]);
+			header = header.slice(0, o);
+		}
+	}
+	return new Blob([header, ...chunks], {
+		type:"audio/wav",
+	});
+};
+const addFile = async src => {
+	let img = new Image();
+	img.src = src;
+	await img.decode();
+	let d = document.getElementById("fileTemplate").content.cloneNode(true);
+	d.querySelector(".name").textContent = file.name;
+		let canvas = d.querySelector("canvas");
+	d = d.firstElementChild;
+	document.body.appendChild(d);
+	let run = async () => {
+		let height = Math.max(1, ~~(document.getElementById("height").value));
+		canvas.height = height;
+		let width = canvas.width = ~~((height/img.naturalHeight)*img.naturalWidth);
+		let ctx = canvas.getContext("2d");
+		let modes = new Map();
+		let readMode = (x0, x1, mode) => {
+			for (let x=x0;x<x1;x++){
+				modes.set(x, mode);
+			}
+			ctx.clearRect(0, 0, width, height);
+			ctx.drawImage(img, 0, 0, width, height);
+			for (let x=0;x<width;x++) {
+				switch (modes.get(x)) {
+					default: ctx.fillStyle = "rgba(255, 0, 0, .8)"; break;
+					case 1: ctx.fillStyle = "rgba(255, 0, 0, .4)"; break;
+					case 2: continue;
+				}
+				ctx.fillRect(x, 0, 1, height);
+			}
+		}
+		d.classList.remove("loaded");
+		readMode(0,0,0);
+		let wavBlob;
+		{
+			let readCanvas = document.createElement("canvas");
+			readCanvas.width = canvas.width;
+			readCanvas.height = canvas.height;
+			let readCtx = readCanvas.getContext("2d");
+				ctx.clearRect(0, 0, width, height);
+			readCtx.drawImage(img, 0, 0, width, height);
+			wavBlob = await canvasToWAV(readCanvas, readMode, {
+				pixelRate: Math.max(1, ~~(document.getElementById("pixelRate").value)),
+				minFreq: Math.max(1, ~~(document.getElementById("minFreq").value)),
+				maxFreq: Math.max(100, ~~(document.getElementById("maxFreq").value)),
+				height,
+			});
+		}
+		ctx.drawImage(img, 0, 0, width, height);
+		let audioSrc = URL.createObjectURL(wavBlob);
+		{
+			let audio = d.querySelector("audio")
+			audio.src = audioSrc;
+			audio.addEventListener("timeupdate", ev => {
+				let x = (audio.currentTime/audio.duration) * canvas.width;
+				ctx.fillStyle = "#7f7f7f";
+				ctx.clearRect(0, 0, width, height);
+				ctx.drawImage(img, 0, 0, width, height);
+				ctx.fillRect(x, 0, 1, height);
+			});
+		}
+		{
+			let dl = d.querySelector(".dl");
+			dl.href = audioSrc;
+			dl.download=(file.name||"png")+".wav";
+		}
+		d.classList.add("loaded");
+	};
+	d.querySelector(".redo").addEventListener("click", ev => {
+		ev.preventDefault();
+		run();
+	});
+	await run();
+};
+const handle = async files => {
+	try{
+		for (file of files)  {
+			await addFile(URL.createObjectURL(file));
+		}
+	} catch (e) {
+		console.error(e);
+		alert("Error: " + e);
+	}
+}
+document.getElementById("file").addEventListener("change", ev => handle(ev.target.files));
+document.body.addEventListener("drop", ev => {
+	ev.stopPropagation();
+	ev.preventDefault();
+	handle(ev.dataTransfer.files);
+});
+document.body.addEventListener("dragover", ev => {
+	ev.stopPropagation();
+	ev.preventDefault();
+	ev.dataTransfer.dropEffect = "copy";
+});
+		</script>
+	</body>
+</html>
